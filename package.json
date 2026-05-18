@@ -1,0 +1,12 @@
+{
+  "name": "tradingview-alerts",
+  "version": "1.0.0",
+  "description": "Craig Ottun TradingView Alert Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "twilio": "^4.0.0"
+  }
+}
