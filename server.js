@@ -1,6 +1,6 @@
 const http = require('http');
 const twilio = require('twilio');
-const { google } = require('googleapis');
+const https = require('https');
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -8,59 +8,36 @@ const twilioNumber = process.env.TWILIO_PHONE_NUMBER;
 const yourNumber = process.env.YOUR_PHONE_NUMBER;
 const client = twilio(accountSid, authToken);
 
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-const SERVICE_ACCOUNT_KEY_RAW = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
-
-let serviceAccountKey;
-try {
-  serviceAccountKey = JSON.parse(SERVICE_ACCOUNT_KEY_RAW);
-} catch (e) {
-  console.error('Failed to parse GOOGLE_SERVICE_ACCOUNT_KEY:', e.message);
-}
-
-async function getSheetsClient() {
-  const auth = new google.auth.JWT(
-    SERVICE_ACCOUNT_EMAIL,
-    null,
-    serviceAccountKey.private_key,
-    ['https://www.googleapis.com/auth/spreadsheets']
-  );
-  await auth.authorize();
-  return google.sheets({ version: 'v4', auth });
-}
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzjOQ20Qv9UosNolCXZwp0gMNGRvc4IKu9L95lyoIupo3DqeLw-VSwe5ymUqiaIVjwH5Q/exec';
 
 async function logToSheet(data) {
-  try {
-    const sheets = await getSheetsClient();
-    const timestamp = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' });
-    const row = [
-      timestamp,
-      data.ticker || '',
-      data.signal || '',
-      data.price || '',
-      data.algo || detectAlgo(data),
-      data.message || '',
-      ''
-    ];
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Sheet1!A:G',
-      valueInputOption: 'USER_ENTERED',
-      resource: { values: [row] }
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(data);
+    const url = new URL(APPS_SCRIPT_URL);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        console.log('Sheet response:', body);
+        resolve(body);
+      });
     });
-    console.log('Logged to Google Sheet:', row);
-  } catch (err) {
-    console.error('Google Sheets error:', err.message);
-  }
-}
-
-function detectAlgo(data) {
-  const text = JSON.stringify(data).toLowerCase();
-  if (text.includes('zsx') || text.includes('zsu') || text.includes('bean') || text.includes('soy')) return 'Jarvis SB V1';
-  if (text.includes('gff') || text.includes('gfk') || text.includes('gfu') || text.includes('cattle') || text.includes('feeder')) return 'FC V8a';
-  if (text.includes('zcz') || text.includes('zcn') || text.includes('corn')) return 'FC V8c Corn';
-  return 'Unknown';
+    req.on('error', (e) => {
+      console.error('Sheet error:', e.message);
+      reject(e);
+    });
+    req.write(payload);
+    req.end();
+  });
 }
 
 function getEmoji(text) {
