@@ -86,3 +86,4 @@ function formatMessage(body) {
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
+    server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
