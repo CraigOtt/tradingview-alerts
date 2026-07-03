@@ -1,126 +1,193 @@
 const http = require('http');
-const twilio = require('twilio');
 const https = require('https');
 
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const twilioNumber = process.env.TWILIO_PHONE_NUMBER;
-const yourNumber = process.env.YOUR_PHONE_NUMBER;
-const client = twilio(accountSid, authToken);
+// ── Environment variables ─────────────────────
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
+const APPS_SCRIPT_URL    = process.env.APPS_SCRIPT_URL;
 
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzjOQ20Qv9UosNolCXZwp0gMNGRvc4IKu9L95lyoIupo3DqeLw-VSwe5ymUqiaIVjwH5Q/exec';
-
-function detectAlgo(data) {
-  const text = JSON.stringify(data).toLowerCase();
-  if (text.includes('zsx') || text.includes('bean') || text.includes('soy')) return 'Jarvis SB V1';
-  if (text.includes('gff') || text.includes('cattle') || text.includes('feeder')) return 'FC V8a';
-  if (text.includes('zcz') || text.includes('corn')) return 'FC V8c Corn';
-  return 'Unknown';
-}
-
-async function logToSheet(data) {
+// ── Send Telegram message ─────────────────────
+function sendTelegram(text) {
   return new Promise((resolve, reject) => {
-    const params = new URLSearchParams({
-      ticker: data.ticker || '',
-      signal: data.signal || '',
-      price: data.price || '',
-      algo: data.algo || detectAlgo(data),
-      message: data.message || ''
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+      console.log('Telegram not configured — skipping SMS');
+      resolve();
+      return;
+    }
+    const payload = JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      text: text,
+      parse_mode: 'HTML'
     });
-
-    const urlString = APPS_SCRIPT_URL + '?' + params.toString();
-    const url = new URL(urlString);
-
     const options = {
-      hostname: url.hostname,
-      path: url.pathname + url.search,
-      method: 'GET'
-    };
-
-    const req = require('https').request(options, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
-        const redirectUrl = new URL(res.headers.location);
-        const redirectOptions = {
-          hostname: redirectUrl.hostname,
-          path: redirectUrl.pathname + redirectUrl.search,
-          method: 'GET'
-        };
-        const req2 = require('https').request(redirectOptions, (res2) => {
-          let body = '';
-          res2.on('data', chunk => body += chunk);
-          res2.on('end', () => { console.log('Sheet response:', body); resolve(body); });
-        });
-        req2.on('error', reject);
-        req2.end();
-        return;
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
       }
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => { console.log('Sheet response:', body); resolve(body); });
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        console.log('Telegram response:', data);
+        resolve();
+      });
     });
-    req.on('error', reject);
+    req.on('error', (err) => {
+      console.error('Telegram error:', err.message);
+      reject(err);
+    });
+    req.write(payload);
     req.end();
   });
 }
 
-function getEmoji(text) {
-  const lower = text.toLowerCase();
-  if (lower.includes('corn')) return '🌽';
-  if (lower.includes('soybean') || lower.includes('bean')) return '🫘';
-  if (lower.includes('cattle') || lower.includes('feeder')) return '🐄';
-  return '📊';
+// ── Log to Google Sheet via Apps Script ───────
+function logToSheet(params) {
+  return new Promise((resolve) => {
+    if (!APPS_SCRIPT_URL) { resolve(); return; }
+    const url = new URL(APPS_SCRIPT_URL);
+    Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, v));
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers: { 'User-Agent': 'Jarvis-Trading-Bot/1.0' }
+    };
+    const req = https.request(options, (res) => {
+      // Follow redirect if needed
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        const redirectUrl = new URL(res.headers.location);
+        const redirOptions = {
+          hostname: redirectUrl.hostname,
+          path: redirectUrl.pathname + redirectUrl.search,
+          method: 'GET'
+        };
+        https.request(redirOptions, (r2) => {
+          let d = '';
+          r2.on('data', c => d += c);
+          r2.on('end', () => { console.log('Sheet log:', d); resolve(); });
+        }).end();
+      } else {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => { console.log('Sheet log:', d); resolve(); });
+      }
+    });
+    req.on('error', (err) => {
+      console.error('Sheet error:', err.message);
+      resolve();
+    });
+    req.end();
+  });
 }
 
-function formatMessage(body) {
+// ── Parse incoming alert message ──────────────
+function parseAlert(body) {
   try {
-    const data = JSON.parse(body);
-    const emoji = getEmoji(JSON.stringify(data));
-    let msg = `${emoji} TRADING ALERT\n`;
-    msg += `━━━━━━━━━━━━\n`;
-    if (data.ticker)  msg += `Contract: ${data.ticker}\n`;
-    if (data.signal)  msg += `Signal: ${data.signal}\n`;
-    if (data.price)   msg += `Price: ${data.price}\n`;
-    if (data.adx)     msg += `ADX: ${data.adx}\n`;
-    if (data.mode)    msg += `Mode: ${data.mode}\n`;
-    if (data.message) msg += `${data.message}\n`;
-    msg += `Time: ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago' })} CT`;
-    return msg;
-  } catch (e) {
-    const emoji = getEmoji(body);
-    return `${emoji} TRADING ALERT\n━━━━━━━━━━━━\n${body}\nTime: ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago' })} CT`;
+    return JSON.parse(body);
+  } catch(e) {
+    return { raw: body };
   }
 }
 
+// ── Format Telegram message ───────────────────
+function formatTelegram(data) {
+  const time = new Date().toLocaleTimeString('en-US', {
+    timeZone: 'America/Chicago',
+    hour: '2-digit', minute: '2-digit'
+  });
+
+  // Parse the message field for conviction label
+  const msg     = (data.message || '').toString();
+  const ticker  = data.ticker  || '';
+  const signal  = (data.signal || '').toUpperCase();
+  const price   = data.price   || '';
+  const algo    = data.algo    || '';
+
+  // Extract conviction label if present
+  const convMatch = msg.match(/—\s*(PRIME ENTRY|CONFIRMED|MAX ALIGNMENT)/);
+  const conviction = convMatch ? convMatch[1] : '';
+
+  // Extract position
+  const posMatch = msg.match(/POS:\s*(-?\d+)/);
+  const pos = posMatch ? parseInt(posMatch[1]) : null;
+
+  // Choose emoji
+  let emoji = '📊';
+  if (ticker.includes('GF')) emoji = '🐄';
+  else if (ticker.includes('ZC')) emoji = '🌽';
+  else if (ticker.includes('ZS')) emoji = '🫘';
+
+  // Signal emoji
+  let sigEmoji = '';
+  if (signal === 'LONG' || signal === 'BUY')   sigEmoji = '🟢';
+  else if (signal === 'SHORT' || signal === 'SELL') sigEmoji = '🔴';
+  else if (signal === 'FLAT')                   sigEmoji = '⬜';
+  else if (signal === 'STOP')                   sigEmoji = '🛑';
+
+  let text = `${emoji} <b>JARVIS ALERT</b>\n`;
+  text += `━━━━━━━━━━━━━━━━\n`;
+  text += `${sigEmoji} <b>${signal}</b>  ${ticker}\n`;
+  if (conviction) text += `📈 ${conviction}\n`;
+  if (price)      text += `💰 Price: <b>${price}</b>\n`;
+  if (pos !== null) text += `📦 Position: ${pos > 0 ? '+' : ''}${pos} ct\n`;
+  text += `⏰ ${time} CT\n`;
+  if (algo)       text += `<i>${algo}</i>`;
+
+  return text;
+}
+
+// ── HTTP Server ───────────────────────────────
 const server = http.createServer((req, res) => {
+
+  // Health check
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
-    res.end('Craig Ottun Alert Server — Online');
+    res.end('🌽🫘🐄 Jarvis Trading Server — Online');
     return;
   }
+
+  // Webhook
   if (req.method === 'POST' && req.url === '/webhook') {
     let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('data', chunk => body += chunk.toString());
     req.on('end', async () => {
       console.log('Alert received:', body);
-      const message = formatMessage(body);
-      let data = {};
-      try { data = JSON.parse(body); } catch (e) { data = { message: body }; }
-      const [smsResult, sheetResult] = await Promise.allSettled([
-        client.messages.create({ body: message, from: twilioNumber, to: `+1${yourNumber}` }),
-        logToSheet(data)
-      ]);
-      if (smsResult.status === 'fulfilled') console.log('SMS sent');
-      else console.error('SMS error:', smsResult.reason.message);
-      if (sheetResult.status === 'fulfilled') console.log('Sheet logged');
-      else console.error('Sheet error:', sheetResult.reason.message);
       res.writeHead(200);
       res.end('OK');
+
+      const data = parseAlert(body);
+      const telegramMsg = formatTelegram(data);
+
+      // Run in parallel — don't block each other
+      try {
+        await Promise.all([
+          sendTelegram(telegramMsg),
+          logToSheet({
+            ticker:  data.ticker  || '',
+            signal:  data.signal  || '',
+            price:   data.price   || '',
+            algo:    data.algo    || '',
+            message: data.message || body
+          })
+        ]);
+        console.log('Alert processed successfully');
+      } catch(err) {
+        console.error('Alert processing error:', err.message);
+      }
     });
     return;
   }
+
   res.writeHead(404);
   res.end('Not found');
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Jarvis Trading Server running on port ${PORT}`);
+});
