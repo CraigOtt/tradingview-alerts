@@ -156,8 +156,13 @@ async function handleTelegramReply(update) {
   const multiplier      = getMultiplier(signal.ticker);
   const slippageDollars = slippagePts * multiplier;
   const sign    = slippageDollars >= 0 ? '+' : '';
-  const verdict = slippageDollars <= 0 ? '✅ favorable' :
-                  Math.abs(slippageDollars) < 50 ? '⚠️ minor adverse' : '🛑 significant adverse';
+const isShort = (signal.signal || '').toUpperCase() === 'SHORT' || 
+                (signal.signal || '').toUpperCase() === 'SELL';
+const verdict = isShort
+  ? (slippageDollars >= 0 ? '✅ favorable' : 
+     Math.abs(slippageDollars) < 50 ? '⚠️ minor adverse' : '🛑 significant adverse')
+  : (slippageDollars <= 0 ? '✅ favorable' : 
+     Math.abs(slippageDollars) < 50 ? '⚠️ minor adverse' : '🛑 significant adverse');
   const confirmMsg =
     '✅ <b>SLIPPAGE LOGGED</b>\n' +
     '━━━━━━━━━━━━━━━━\n' +
