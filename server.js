@@ -158,11 +158,17 @@ async function handleTelegramReply(update) {
   const sign    = slippageDollars >= 0 ? '+' : '';
 const isShort = (signal.signal || '').toUpperCase() === 'SHORT' || 
                 (signal.signal || '').toUpperCase() === 'SELL';
+
+// Instrument-aware significance thresholds
+const sigThreshold = signal.ticker.includes('GF') ? 500 :
+                     signal.ticker.includes('ZC') ? 100 :
+                     signal.ticker.includes('ZS') ? 100 : 100;
+
 const verdict = isShort
   ? (slippageDollars >= 0 ? '✅ favorable' : 
-     Math.abs(slippageDollars) < 50 ? '⚠️ minor adverse' : '🛑 significant adverse')
+     Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse')
   : (slippageDollars <= 0 ? '✅ favorable' : 
-     Math.abs(slippageDollars) < 50 ? '⚠️ minor adverse' : '🛑 significant adverse');
+     Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse');
   const confirmMsg =
     '✅ <b>SLIPPAGE LOGGED</b>\n' +
     '━━━━━━━━━━━━━━━━\n' +
