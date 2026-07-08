@@ -7,7 +7,6 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const APPS_SCRIPT_URL    = process.env.APPS_SCRIPT_URL;
 
 // ── In-memory signal store ────────────────────
-// Maps Telegram message_id → signal data so replies can be matched
 const recentSignals = new Map();
 const MAX_STORED = 100;
 
@@ -28,9 +27,9 @@ function storeSignal(messageId, data) {
 
 // ── Contract multipliers ──────────────────────
 function getMultiplier(ticker) {
-  if (ticker.includes('GF')) return 500;  // 1 full point = $500
-  if (ticker.includes('ZC')) return 50;   // 1 cent = $50
-  if (ticker.includes('ZS')) return 50;   // 1 cent = $50
+  if (ticker.includes('GF')) return 500;
+  if (ticker.includes('ZC')) return 50;
+  if (ticker.includes('ZS')) return 50;
   return 1;
 }
 
@@ -116,24 +115,38 @@ function formatTelegram(data) {
   const conviction = convMatch ? convMatch[1] : '';
   const posMatch = msg.match(/POS:\s*(-?\d+)/);
   const pos = posMatch ? parseInt(posMatch[1]) : null;
+
   let emoji = '📊';
   if (ticker.includes('GF')) emoji = '🐄';
   else if (ticker.includes('ZC')) emoji = '🌽';
   else if (ticker.includes('ZS')) emoji = '🫘';
+
   let sigEmoji = '';
   if (signal === 'LONG' || signal === 'BUY') sigEmoji = '🟢';
   else if (signal === 'SHORT' || signal === 'SELL') sigEmoji = '🔴';
   else if (signal === 'FLAT') sigEmoji = '⬜';
   else if (signal === 'STOP') sigEmoji = '🛑';
-  let text = emoji + ' <b>JARVIS ALERT</b>\n';
-  text += '━━━━━━━━━━━━━━━━\n';
+
+  // V10 gets a distinct header so it's immediately recognizable
+  const isV10 = algo.includes('V10');
+
+  let text = emoji + ' <b>JARVIS ALERT</b>';
+  if (isV10) text += ' <i>[SHADOW]</i>';
+  text += '\n━━━━━━━━━━━━━━━━\n';
   text += sigEmoji + ' <b>' + signal + '</b>  ' + ticker + '\n';
   if (conviction) text += '📈 ' + conviction + '\n';
   if (price)      text += '💰 Price: <b>' + price + '</b>\n';
   if (pos !== null) text += '📦 Position: ' + (pos > 0 ? '+' : '') + pos + ' ct\n';
   text += '⏰ ' + time + ' CT\n';
   if (algo) text += '<i>' + algo + '</i>\n';
-  text += '\n<i>Reply "traded 356.50" to log your fill</i>';
+
+  // V10 = no action; V9/others = reply to log slippage
+  if (isV10) {
+    text += '\n<i>🔬 V10 shadow tracking — no action needed</i>';
+  } else {
+    text += '\n<i>Reply "traded 356.50" to log your fill</i>';
+  }
+
   return text;
 }
 
@@ -145,30 +158,38 @@ async function handleTelegramReply(update) {
   const replyToId = message.reply_to_message.message_id;
   const match = text.match(/^traded\s+([\d.]+)/i);
   if (!match) return;
-  const fillPrice   = parseFloat(match[1]);
-  const signal      = recentSignals.get(replyToId);
+  const fillPrice = parseFloat(match[1]);
+  const signal    = recentSignals.get(replyToId);
   if (!signal) {
     await sendTelegram('⚠️ <b>Signal not found</b>\nCould not match reply to a stored signal.\nServer may have restarted since the alert fired.', message.message_id);
     return;
   }
+
+  // Block slippage logging on V10 signals
+  if ((signal.algo || '').includes('V10')) {
+    await sendTelegram('⚠️ <b>V10 shadow signal — no slippage logging</b>\nThis was a V10 experimental signal. Only reply "traded" to V9 signals.', message.message_id);
+    return;
+  }
+
   const signalPrice     = parseFloat(signal.price);
   const slippagePts     = fillPrice - signalPrice;
   const multiplier      = getMultiplier(signal.ticker);
   const slippageDollars = slippagePts * multiplier;
-  const sign    = slippageDollars >= 0 ? '+' : '';
-const isShort = (signal.signal || '').toUpperCase() === 'SHORT' || 
-                (signal.signal || '').toUpperCase() === 'SELL';
+  const sign = slippageDollars >= 0 ? '+' : '';
 
-// Instrument-aware significance thresholds
-const sigThreshold = signal.ticker.includes('GF') ? 500 :
-                     signal.ticker.includes('ZC') ? 100 :
-                     signal.ticker.includes('ZS') ? 100 : 100;
+  const isShort = (signal.signal || '').toUpperCase() === 'SHORT' ||
+                  (signal.signal || '').toUpperCase() === 'SELL';
 
-const verdict = isShort
-  ? (slippageDollars >= 0 ? '✅ favorable' : 
-     Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse')
-  : (slippageDollars <= 0 ? '✅ favorable' : 
-     Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse');
+  const sigThreshold = signal.ticker.includes('GF') ? 500 :
+                       signal.ticker.includes('ZC') ? 100 :
+                       signal.ticker.includes('ZS') ? 100 : 100;
+
+  const verdict = isShort
+    ? (slippageDollars >= 0 ? '✅ favorable' :
+       Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse')
+    : (slippageDollars <= 0 ? '✅ favorable' :
+       Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse');
+
   const confirmMsg =
     '✅ <b>SLIPPAGE LOGGED</b>\n' +
     '━━━━━━━━━━━━━━━━\n' +
@@ -178,6 +199,7 @@ const verdict = isShort
     '📊 Slip: ' + sign + slippagePts.toFixed(4) + ' pts  (' + sign + '$' + slippageDollars.toFixed(2) + ')\n' +
     verdict + '\n' +
     '<i>' + signal.algo + '</i>';
+
   await sendTelegram(confirmMsg, message.message_id);
   await logToSheet({
     action:          'logSlippage',
