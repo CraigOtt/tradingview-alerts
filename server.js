@@ -16,13 +16,14 @@ function storeSignal(messageId, data) {
     signal:    data.signal  || '',
     price:     data.price   || '',
     algo:      data.algo    || '',
+    stopLevel: data.stopLevel || null,
     timestamp: Date.now()
   });
   if (recentSignals.size > MAX_STORED) {
     const firstKey = recentSignals.keys().next().value;
     recentSignals.delete(firstKey);
   }
-  console.log('Signal stored — message_id:', messageId, 'ticker:', data.ticker, 'price:', data.price);
+  console.log('Signal stored — message_id:', messageId, 'ticker:', data.ticker, 'price:', data.price, 'stop:', data.stopLevel);
 }
 
 // ── Contract multipliers ──────────────────────
@@ -30,6 +31,8 @@ function getMultiplier(ticker) {
   if (ticker.includes('GF')) return 500;
   if (ticker.includes('ZC')) return 50;
   if (ticker.includes('ZS')) return 50;
+  if (ticker.includes('ES') || ticker.includes('SP')) return 50;
+  if (ticker.includes('MES')) return 5;
   return 1;
 }
 
@@ -103,6 +106,12 @@ function parseAlert(body) {
   try { return JSON.parse(body); } catch(e) { return { raw: body }; }
 }
 
+// ── Extract stop level from message string ────
+function parseStopLevel(msg) {
+  const m = (msg || '').match(/STOP:([\d.]+)/);
+  return m ? m[1] : null;
+}
+
 // ── Format Telegram alert message ────────────
 function formatTelegram(data) {
   const time = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit' });
@@ -111,6 +120,13 @@ function formatTelegram(data) {
   const signal   = (data.signal || '').toUpperCase();
   const price    = data.price   || '';
   const algo     = data.algo    || '';
+
+  // Extract stop level from message payload
+  const stopLevel = parseStopLevel(msg);
+
+  // Store stop level on data object for signal storage
+  data.stopLevel = stopLevel;
+
   const convMatch  = msg.match(/\u2014\s*(PRIME ENTRY|CONFIRMED|MAX ALIGNMENT)/);
   const conviction = convMatch ? convMatch[1] : '';
   const posMatch = msg.match(/POS:\s*(-?\d+)/);
@@ -120,6 +136,7 @@ function formatTelegram(data) {
   if (ticker.includes('GF')) emoji = '🐄';
   else if (ticker.includes('ZC')) emoji = '🌽';
   else if (ticker.includes('ZS')) emoji = '🫘';
+  else if (ticker.includes('ES') || ticker.includes('SP') || ticker.includes('MES')) emoji = '📈';
 
   let sigEmoji = '';
   if (signal === 'LONG' || signal === 'BUY') sigEmoji = '🟢';
@@ -127,22 +144,39 @@ function formatTelegram(data) {
   else if (signal === 'FLAT') sigEmoji = '⬜';
   else if (signal === 'STOP') sigEmoji = '🛑';
 
-  // V10 gets a distinct header so it's immediately recognizable
-  const isV10 = algo.includes('V10');
+  const isV10      = algo.includes('V10');
+  const isSP500    = algo.includes('SP500');
+  const isPaperFirst = isSP500;
 
   let text = emoji + ' <b>JARVIS ALERT</b>';
-  if (isV10) text += ' <i>[SHADOW]</i>';
+  if (isV10)       text += ' <i>[SHADOW]</i>';
+  if (isPaperFirst) text += ' <i>[PAPER]</i>';
   text += '\n━━━━━━━━━━━━━━━━\n';
   text += sigEmoji + ' <b>' + signal + '</b>  ' + ticker + '\n';
   if (conviction) text += '📈 ' + conviction + '\n';
   if (price)      text += '💰 Price: <b>' + price + '</b>\n';
+
+  // Show stop level on entry signals
+  if (stopLevel && (signal === 'LONG' || signal === 'BUY')) {
+    text += '🛑 Stop: <b>' + stopLevel + '</b>\n';
+    // Calculate approximate dollar risk
+    const multiplier = getMultiplier(ticker);
+    const priceDiff = parseFloat(price) - parseFloat(stopLevel);
+    if (!isNaN(priceDiff) && priceDiff > 0) {
+      const dollarRisk = (priceDiff * multiplier).toFixed(0);
+      text += '💸 Max risk: <b>$' + dollarRisk + '</b>\n';
+    }
+  }
+
   if (pos !== null) text += '📦 Position: ' + (pos > 0 ? '+' : '') + pos + ' ct\n';
   text += '⏰ ' + time + ' CT\n';
   if (algo) text += '<i>' + algo + '</i>\n';
 
-  // V10 = no action; V9/others = reply to log slippage
+  // Footer by algo type
   if (isV10) {
     text += '\n<i>🔬 V10 shadow tracking — no action needed</i>';
+  } else if (isPaperFirst) {
+    text += '\n<i>📋 Paper validation — reply "traded [price]" to log fill</i>';
   } else {
     text += '\n<i>Reply "traded 356.50" to log your fill</i>';
   }
@@ -182,7 +216,8 @@ async function handleTelegramReply(update) {
 
   const sigThreshold = signal.ticker.includes('GF') ? 500 :
                        signal.ticker.includes('ZC') ? 100 :
-                       signal.ticker.includes('ZS') ? 100 : 100;
+                       signal.ticker.includes('ZS') ? 100 :
+                       (signal.ticker.includes('ES') || signal.ticker.includes('SP')) ? 500 : 100;
 
   const verdict = isShort
     ? (slippageDollars >= 0 ? '✅ favorable' :
@@ -190,15 +225,23 @@ async function handleTelegramReply(update) {
     : (slippageDollars <= 0 ? '✅ favorable' :
        Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse');
 
-  const confirmMsg =
+  // Build confirmation with stop reminder if available
+  let confirmMsg =
     '✅ <b>SLIPPAGE LOGGED</b>\n' +
     '━━━━━━━━━━━━━━━━\n' +
     '📋 ' + signal.ticker + ' — ' + signal.signal + '\n' +
     '🎯 Signal: <b>' + signal.price + '</b>\n' +
     '💵 Fill:   <b>' + fillPrice + '</b>\n' +
     '📊 Slip: ' + sign + slippagePts.toFixed(4) + ' pts  (' + sign + '$' + slippageDollars.toFixed(2) + ')\n' +
-    verdict + '\n' +
-    '<i>' + signal.algo + '</i>';
+    verdict + '\n';
+
+  // Remind trader of stop level if available
+  if (signal.stopLevel) {
+    const stopDollar = ((fillPrice - parseFloat(signal.stopLevel)) * multiplier).toFixed(0);
+    confirmMsg += '🛑 Place stop at: <b>' + signal.stopLevel + '</b>  (~$' + stopDollar + ' risk)\n';
+  }
+
+  confirmMsg += '<i>' + signal.algo + '</i>';
 
   await sendTelegram(confirmMsg, message.message_id);
   await logToSheet({
@@ -218,7 +261,7 @@ async function handleTelegramReply(update) {
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
-    res.end('🌽🫘🐄 Jarvis Trading Server — Online (Slippage Tracker Active)');
+    res.end('🌽🫘🐄📈 Jarvis Trading Server — Online (Slippage Tracker Active)');
     return;
   }
   if (req.method === 'POST' && req.url === '/webhook') {
