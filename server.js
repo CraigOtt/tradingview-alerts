@@ -17,13 +17,15 @@ function storeSignal(messageId, data) {
     price:     data.price   || '',
     algo:      data.algo    || '',
     stopLevel: data.stopLevel || null,
+    atr:       data.atr || null,
+    suggestedMes: data.suggestedMes || null,
     timestamp: Date.now()
   });
   if (recentSignals.size > MAX_STORED) {
     const firstKey = recentSignals.keys().next().value;
     recentSignals.delete(firstKey);
   }
-  console.log('Signal stored — message_id:', messageId, 'ticker:', data.ticker, 'price:', data.price, 'stop:', data.stopLevel);
+  console.log('Signal stored — message_id:', messageId, 'ticker:', data.ticker, 'price:', data.price, 'stop:', data.stopLevel, 'atr:', data.atr, 'mes:', data.suggestedMes);
 }
 
 // ── Contract multipliers ──────────────────────
@@ -31,8 +33,8 @@ function getMultiplier(ticker) {
   if (ticker.includes('GF')) return 500;
   if (ticker.includes('ZC')) return 50;
   if (ticker.includes('ZS')) return 50;
-  if (ticker.includes('ES') || ticker.includes('SP')) return 50;
   if (ticker.includes('MES')) return 5;
+  if (ticker.includes('ES') || ticker.includes('SP')) return 50;
   return 1;
 }
 
@@ -106,9 +108,9 @@ function parseAlert(body) {
   try { return JSON.parse(body); } catch(e) { return { raw: body }; }
 }
 
-// ── Extract stop level from message string ────
-function parseStopLevel(msg) {
-  const m = (msg || '').match(/STOP:([\d.]+)/);
+// ── Extract fields from message string ────────
+function parseField(msg, field) {
+  const m = (msg || '').match(new RegExp(field + ':([\\d.\\-]+)'));
   return m ? m[1] : null;
 }
 
@@ -121,11 +123,15 @@ function formatTelegram(data) {
   const price    = data.price   || '';
   const algo     = data.algo    || '';
 
-  // Extract stop level from message payload
-  const stopLevel = parseStopLevel(msg);
+  // Extract sizing fields from message payload
+  const stopLevel = parseField(msg, 'STOP');
+  const atr       = parseField(msg, 'ATR');
+  const suggestedMes = parseField(msg, 'MES');
 
-  // Store stop level on data object for signal storage
+  // Store on data object for signal storage
   data.stopLevel = stopLevel;
+  data.atr = atr;
+  data.suggestedMes = suggestedMes;
 
   const convMatch  = msg.match(/\u2014\s*(PRIME ENTRY|CONFIRMED|MAX ALIGNMENT)/);
   const conviction = convMatch ? convMatch[1] : '';
@@ -144,39 +150,41 @@ function formatTelegram(data) {
   else if (signal === 'FLAT') sigEmoji = '⬜';
   else if (signal === 'STOP') sigEmoji = '🛑';
 
-  const isV10      = algo.includes('V10');
-  const isSP500    = algo.includes('SP500');
+  const isV10        = algo.includes('V10');
+  const isSP500      = algo.includes('SP500');
   const isPaperFirst = isSP500;
 
   let text = emoji + ' <b>JARVIS ALERT</b>';
-  if (isV10)       text += ' <i>[SHADOW]</i>';
+  if (isV10)        text += ' <i>[SHADOW]</i>';
   if (isPaperFirst) text += ' <i>[PAPER]</i>';
   text += '\n━━━━━━━━━━━━━━━━\n';
   text += sigEmoji + ' <b>' + signal + '</b>  ' + ticker + '\n';
   if (conviction) text += '📈 ' + conviction + '\n';
   if (price)      text += '💰 Price: <b>' + price + '</b>\n';
 
-  // Show stop level on entry signals
-  if (stopLevel && (signal === 'LONG' || signal === 'BUY')) {
-    text += '🛑 Stop: <b>' + stopLevel + '</b>\n';
-    // Calculate approximate dollar risk
-    const multiplier = getMultiplier(ticker);
-    const priceDiff = parseFloat(price) - parseFloat(stopLevel);
-    if (!isNaN(priceDiff) && priceDiff > 0) {
-      const dollarRisk = (priceDiff * multiplier).toFixed(0);
-      text += '💸 Max risk: <b>$' + dollarRisk + '</b>\n';
+  // Show stop, ATR, and suggested MES on entry signals
+  if ((signal === 'LONG' || signal === 'BUY')) {
+    if (stopLevel) {
+      text += '🛑 Stop: <b>' + stopLevel + '</b>\n';
+      const multiplier = getMultiplier(ticker);
+      const priceDiff = parseFloat(price) - parseFloat(stopLevel);
+      if (!isNaN(priceDiff) && priceDiff > 0) {
+        const dollarRisk = (priceDiff * multiplier).toFixed(0);
+        text += '💸 Max risk (1 ES): <b>$' + dollarRisk + '</b>\n';
+      }
     }
+    if (atr) text += '📊 ATR: <b>' + atr + '</b>\n';
+    if (suggestedMes) text += '📐 Suggested size: <b>' + suggestedMes + ' MES</b>\n';
   }
 
   if (pos !== null) text += '📦 Position: ' + (pos > 0 ? '+' : '') + pos + ' ct\n';
   text += '⏰ ' + time + ' CT\n';
   if (algo) text += '<i>' + algo + '</i>\n';
 
-  // Footer by algo type
   if (isV10) {
     text += '\n<i>🔬 V10 shadow tracking — no action needed</i>';
   } else if (isPaperFirst) {
-    text += '\n<i>📋 Paper validation — reply "traded [price]" to log fill</i>';
+    text += '\n<i>📋 Paper — just reply "traded [price]". ATR & size auto-logged.</i>';
   } else {
     text += '\n<i>Reply "traded 356.50" to log your fill</i>';
   }
@@ -199,7 +207,6 @@ async function handleTelegramReply(update) {
     return;
   }
 
-  // Block slippage logging on V10 signals
   if ((signal.algo || '').includes('V10')) {
     await sendTelegram('⚠️ <b>V10 shadow signal — no slippage logging</b>\nThis was a V10 experimental signal. Only reply "traded" to V9 signals.', message.message_id);
     return;
@@ -225,7 +232,6 @@ async function handleTelegramReply(update) {
     : (slippageDollars <= 0 ? '✅ favorable' :
        Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse');
 
-  // Build confirmation with stop reminder if available
   let confirmMsg =
     '✅ <b>SLIPPAGE LOGGED</b>\n' +
     '━━━━━━━━━━━━━━━━\n' +
@@ -235,10 +241,11 @@ async function handleTelegramReply(update) {
     '📊 Slip: ' + sign + slippagePts.toFixed(4) + ' pts  (' + sign + '$' + slippageDollars.toFixed(2) + ')\n' +
     verdict + '\n';
 
-  // Remind trader of stop level if available
-  if (signal.stopLevel) {
-    const stopDollar = ((fillPrice - parseFloat(signal.stopLevel)) * multiplier).toFixed(0);
-    confirmMsg += '🛑 Place stop at: <b>' + signal.stopLevel + '</b>  (~$' + stopDollar + ' risk)\n';
+  // Sizing shadow record confirmation (ES/SP500 only)
+  if (signal.atr || signal.suggestedMes) {
+    confirmMsg += '━━━━━━━━━━━━━━━━\n';
+    if (signal.atr) confirmMsg += '📊 ATR logged: <b>' + signal.atr + '</b>\n';
+    if (signal.suggestedMes) confirmMsg += '📐 Vol-scaled size logged: <b>' + signal.suggestedMes + ' MES</b>\n';
   }
 
   confirmMsg += '<i>' + signal.algo + '</i>';
@@ -252,16 +259,18 @@ async function handleTelegramReply(update) {
     fillPrice:       fillPrice.toString(),
     slippagePts:     slippagePts.toFixed(4),
     slippageDollars: slippageDollars.toFixed(2),
-    algo:            signal.algo
+    algo:            signal.algo,
+    atr:             signal.atr || '',
+    suggestedMes:    signal.suggestedMes || ''
   });
-  console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice, 'slip=$' + slippageDollars.toFixed(2));
+  console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice, 'slip=$' + slippageDollars.toFixed(2), 'atr=' + signal.atr, 'mes=' + signal.suggestedMes);
 }
 
 // ── HTTP Server ───────────────────────────────
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
-    res.end('🌽🫘🐄📈 Jarvis Trading Server — Online (Slippage Tracker Active)');
+    res.end('🌽🫘🐄📈 Jarvis Trading Server — Online (Slippage + Sizing Shadow Active)');
     return;
   }
   if (req.method === 'POST' && req.url === '/webhook') {
