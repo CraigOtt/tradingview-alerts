@@ -281,6 +281,17 @@ const server = http.createServer((req, res) => {
       res.writeHead(200);
       res.end('OK');
       const data = parseAlert(body);
+
+      // SKIP = composite filter suppressed an entry (SP500 V2 dead-zone).
+      // Log to the sheet for the dashboard skip counter, but no Telegram
+      // ping and no stored signal — nothing was traded, so there's nothing
+      // to reply "traded" to. Prevents noise pings and bogus slippage logs.
+      if ((data.signal || '').toUpperCase() === 'SKIP') {
+        await logToSheet({ ticker: data.ticker || '', signal: data.signal || '', price: data.price || '', algo: data.algo || '', message: data.message || body });
+        console.log('SKIP logged (no Telegram, no store):', data.ticker, data.price);
+        return;
+      }
+
       const telegramMsg = formatTelegram(data);
       try {
         const [messageId] = await Promise.all([
