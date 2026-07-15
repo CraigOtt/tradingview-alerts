@@ -77,9 +77,10 @@ function sendTelegram(text, replyToMessageId) {
 }
 
 // ── Log to Google Sheet via Apps Script ───────
+// Returns the Apps Script response text so callers can verify success.
 function logToSheet(params) {
   return new Promise((resolve) => {
-    if (!APPS_SCRIPT_URL) { resolve(); return; }
+    if (!APPS_SCRIPT_URL) { console.log('Sheet log SKIPPED: APPS_SCRIPT_URL not set'); resolve('NO_URL'); return; }
     const url = new URL(APPS_SCRIPT_URL);
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
     const options = {
@@ -92,13 +93,13 @@ function logToSheet(params) {
       if (res.statusCode === 301 || res.statusCode === 302) {
         const redirectUrl = new URL(res.headers.location);
         https.request({ hostname: redirectUrl.hostname, path: redirectUrl.pathname + redirectUrl.search, method: 'GET' }, (r2) => {
-          let d = ''; r2.on('data', c => d += c); r2.on('end', () => { console.log('Sheet log:', d); resolve(); });
+          let d = ''; r2.on('data', c => d += c); r2.on('end', () => { console.log('Sheet log:', d); resolve(d); });
         }).end();
       } else {
-        let d = ''; res.on('data', c => d += c); res.on('end', () => { console.log('Sheet log:', d); resolve(); });
+        let d = ''; res.on('data', c => d += c); res.on('end', () => { console.log('Sheet log:', d); resolve(d); });
       }
     });
-    req.on('error', (err) => { console.error('Sheet error:', err.message); resolve(); });
+    req.on('error', (err) => { console.error('Sheet error:', err.message); resolve('ERROR: ' + err.message); });
     req.end();
   });
 }
@@ -251,7 +252,7 @@ async function handleTelegramReply(update) {
   confirmMsg += '<i>' + signal.algo + '</i>';
 
   await sendTelegram(confirmMsg, message.message_id);
-  await logToSheet({
+  const sheetResult = await logToSheet({
     action:          'logSlippage',
     ticker:          signal.ticker,
     signal:          signal.signal,
@@ -263,7 +264,7 @@ async function handleTelegramReply(update) {
     atr:             signal.atr || '',
     suggestedMes:    signal.suggestedMes || ''
   });
-  console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice, 'slip=$' + slippageDollars.toFixed(2), 'atr=' + signal.atr, 'mes=' + signal.suggestedMes);
+  console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice, 'slip=$' + slippageDollars.toFixed(2), 'atr=' + signal.atr, 'mes=' + signal.suggestedMes, 'sheet=' + sheetResult);
 }
 
 // ── HTTP Server ───────────────────────────────
@@ -315,6 +316,37 @@ const server = http.createServer((req, res) => {
       try {
         const update = JSON.parse(body);
         console.log('Telegram update:', JSON.stringify(update).slice(0, 300));
+
+        // ── TEST command — exercises the full Sheet-write chain on demand ──
+        // Text "test" to the bot to verify logging end-to-end. It performs a
+        // real write to the Sheet (a TEST row), then reports the actual result
+        // back to you — including whether APPS_SCRIPT_URL is even loaded.
+        // This is the same logToSheet() path the live alerts use, so if this
+        // succeeds, real signals will log too.
+        const incomingText = (update.message && update.message.text || '').trim().toLowerCase();
+        if (incomingText === 'test') {
+          const stamp = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' });
+          const sheetResult = await logToSheet({
+            ticker:  'TEST',
+            signal:  'TEST',
+            price:   '0',
+            algo:    'SYSTEM TEST',
+            message: 'connectivity test ' + stamp
+          });
+          const ok = /OK/i.test(sheetResult);
+          const report =
+            (ok ? '✅ <b>TEST PASSED</b>' : '❌ <b>TEST — check result</b>') + '\n' +
+            '━━━━━━━━━━━━━━━━\n' +
+            'APPS_SCRIPT_URL: ' + (APPS_SCRIPT_URL ? '✅ SET' : '❌ MISSING') + '\n' +
+            'Telegram: ✅ working (you got this)\n' +
+            'Sheet write reply: <code>' + (sheetResult || '(empty)').toString().slice(0, 120) + '</code>\n' +
+            '⏰ ' + stamp + ' CT\n\n' +
+            '<i>Now open Sheet1 — a TEST row should appear. If it did, logging is fully live.</i>';
+          await sendTelegram(report, update.message.message_id);
+          console.log('TEST command run — sheet result:', sheetResult);
+          return;
+        }
+
         await handleTelegramReply(update);
       } catch(err) {
         console.error('Telegram webhook error:', err.message);
