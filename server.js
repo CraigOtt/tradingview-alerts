@@ -286,6 +286,44 @@ async function handleTelegramReply(update) {
   console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice, 'slip=$' + slippageDollars.toFixed(2), 'atr=' + signal.atr, 'mes=' + signal.suggestedMes, 'sheet=' + sheetResult);
 }
 
+// ★ NEW (July 17, 2026): Handle manual price commands from Telegram.
+//   "prices"              → returns the current Prices-tab list
+//   "price TICKER VALUE"  → writes/updates one price (e.g. price GFX2026 356.50)
+// Uses the SAME logToSheet() path as everything else, so it hits the Apps
+// Script updatePrice/getPrices actions on APPS_SCRIPT_URL. Returns true if it
+// handled the message (so the caller can stop), false otherwise.
+async function handlePriceCommand(update) {
+  const message = update.message;
+  if (!message) return false;
+  const rawText = (message.text || '').trim();
+
+  // "prices" — list everything currently stored
+  if (/^prices$/i.test(rawText)) {
+    const list = await logToSheet({ action: 'getPrices' });
+    await sendTelegram('💲 <b>Current Prices</b>\n━━━━━━━━━━━━━━━━\n' + (list || '(none)'), message.message_id);
+    console.log('prices command run →', (list || '').toString().slice(0, 120));
+    return true;
+  }
+
+  // "price TICKER VALUE" — set/update one contract
+  const priceMatch = rawText.match(/^price\s+(\S+)\s+([\d.]+)/i);
+  if (priceMatch) {
+    const result = await logToSheet({ action: 'updatePrice', ticker: priceMatch[1], price: priceMatch[2] });
+    const ok = /^OK/i.test((result || '').toString());
+    await sendTelegram((ok ? '✅ ' : '⚠️ ') + result, message.message_id);
+    console.log('price command run —', priceMatch[1], priceMatch[2], '→', (result || '').toString().slice(0, 120));
+    return true;
+  }
+
+  // Started with "price" but the format was wrong — show usage instead of silence
+  if (/^price(\s|$)/i.test(rawText)) {
+    await sendTelegram('Usage: <code>price TICKER VALUE</code>\nExample: <code>price GFX2026 356.50</code>\nOr text <code>prices</code> to see the full list.', message.message_id);
+    return true;
+  }
+
+  return false;
+}
+
 // ── HTTP Server ───────────────────────────────
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/') {
@@ -376,6 +414,13 @@ const server = http.createServer((req, res) => {
           console.log('TEST command run — sheet result:', sheetResult);
           return;
         }
+
+        // ★ NEW: price / prices commands. Check before the "traded" reply
+        // handler — a price command is a fresh message, not a reply, so it
+        // wouldn't be caught there anyway, but handling it explicitly and
+        // returning keeps the paths clean.
+        const handledPrice = await handlePriceCommand(update);
+        if (handledPrice) return;
 
         await handleTelegramReply(update);
       } catch(err) {
