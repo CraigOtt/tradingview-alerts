@@ -117,7 +117,10 @@ function parseField(msg, field) {
 
 // ── Format Telegram alert message ────────────
 function formatTelegram(data) {
-  const time = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit' });
+  // ★ CHANGED: was toLocaleTimeString (time only). Now toLocaleString with
+  // date fields so alerts show the full date + time, both from ONE
+  // America/Chicago timestamp (the date can't drift off the time near midnight).
+  const time = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   const msg      = (data.message || '').toString();
   const ticker   = data.ticker  || '';
   const signal   = (data.signal || '').toUpperCase();
@@ -187,9 +190,25 @@ function formatTelegram(data) {
   } else if (isPaperFirst) {
     text += '\n<i>📋 Paper — just reply "traded [price]". ATR & size auto-logged.</i>';
   } else {
-    text += '\n<i>Reply "traded 356.50" to log your fill</i>';
+    // ★ CHANGED: was a hardcoded 'Reply "traded 356.50"' (a corn price that
+    // showed up misleadingly on cattle/bean alerts). Now generic.
+    text += '\n<i>Reply "traded [your fill price]" to log your fill</i>';
   }
 
+  return text;
+}
+
+// ★ NEW: Format the FC V9 Watch heads-up (pre-market cross-confirmed notice).
+function formatWatch(data) {
+  const wtime = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const sig = (data.signal || '').toUpperCase();
+  const dir = sig === 'WATCH_LONG' ? '🟢 LONG' : sig === 'WATCH_SHORT' ? '🔴 SHORT' : '👀 WATCH';
+  let text = '🐄 <b>FC V9 WATCH — heads-up</b>\n━━━━━━━━━━━━━━━━\n';
+  text += dir + '  ' + (data.ticker || '') + '\n';
+  if (data.price) text += '💰 Close: <b>' + data.price + '</b>\n';
+  if (data.message) text += '📋 ' + data.message + '\n';
+  text += '⏰ ' + wtime + ' CT\n';
+  text += '<i>Heads-up only — nothing traded, nothing logged. Rest a Market-On-Open order to match the system fill.</i>';
   return text;
 }
 
@@ -282,12 +301,23 @@ const server = http.createServer((req, res) => {
       res.writeHead(200);
       res.end('OK');
       const data = parseAlert(body);
+      const sigUpper = (data.signal || '').toUpperCase();
+
+      // ★ NEW: WATCH passthrough — FC V9 Watch heads-up. Send a Telegram
+      // notification ONLY. No Sheet write, no stored signal (nothing was
+      // traded, so there's nothing to reply "traded" to). Must come BEFORE
+      // the normal alert path so it never lands a junk row in the log.
+      if (sigUpper === 'WATCH' || sigUpper === 'WATCH_SHORT' || sigUpper === 'WATCH_LONG') {
+        await sendTelegram(formatWatch(data));
+        console.log('WATCH forwarded (no log, no store):', data.ticker, data.signal);
+        return;
+      }
 
       // SKIP = composite filter suppressed an entry (SP500 V2 dead-zone).
       // Log to the sheet for the dashboard skip counter, but no Telegram
       // ping and no stored signal — nothing was traded, so there's nothing
       // to reply "traded" to. Prevents noise pings and bogus slippage logs.
-      if ((data.signal || '').toUpperCase() === 'SKIP') {
+      if (sigUpper === 'SKIP') {
         await logToSheet({ ticker: data.ticker || '', signal: data.signal || '', price: data.price || '', algo: data.algo || '', message: data.message || body });
         console.log('SKIP logged (no Telegram, no store):', data.ticker, data.price);
         return;
