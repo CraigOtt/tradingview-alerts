@@ -29,6 +29,8 @@ function storeSignal(messageId, data) {
 }
 
 // ── Contract multipliers ──────────────────────
+// NOTE: order matters. 'ZS' is checked before the generic 'ES' branch, so
+// ZS1! (soybeans, $50/pt) can never fall through to the equity multiplier.
 function getMultiplier(ticker) {
   if (ticker.includes('GF')) return 500;
   if (ticker.includes('ZC')) return 50;
@@ -36,6 +38,17 @@ function getMultiplier(ticker) {
   if (ticker.includes('MES')) return 5;
   if (ticker.includes('ES') || ticker.includes('SP')) return 50;
   return 1;
+}
+
+// ★ v4.3: shared emoji resolver — one place, used by both the fill-alert
+// formatter and the WATCH formatter (formatWatch used to hardcode the cow).
+function marketEmoji(ticker) {
+  const t = ticker || '';
+  if (t.includes('GF')) return '🐄';
+  if (t.includes('ZC')) return '🌽';
+  if (t.includes('ZS')) return '🫘';
+  if (t.includes('ES') || t.includes('SP') || t.includes('MES')) return '📈';
+  return '📊';
 }
 
 // ── Send Telegram message — returns message_id ─
@@ -142,11 +155,7 @@ function formatTelegram(data) {
   const posMatch = msg.match(/POS:\s*(-?\d+)/);
   const pos = posMatch ? parseInt(posMatch[1]) : null;
 
-  let emoji = '📊';
-  if (ticker.includes('GF')) emoji = '🐄';
-  else if (ticker.includes('ZC')) emoji = '🌽';
-  else if (ticker.includes('ZS')) emoji = '🫘';
-  else if (ticker.includes('ES') || ticker.includes('SP') || ticker.includes('MES')) emoji = '📈';
+  const emoji = marketEmoji(ticker);   // ★ v4.3 — shared resolver
 
   let sigEmoji = '';
   if (signal === 'LONG' || signal === 'BUY') sigEmoji = '🟢';
@@ -156,7 +165,10 @@ function formatTelegram(data) {
 
   const isV10        = algo.includes('V10');
   const isSP500      = algo.includes('SP500');
-  const isPaperFirst = isSP500;
+  // ★ v4.3: ZS Carry-Trend is paper too (sub-bar, owner override), so it gets
+  // the [PAPER] tag and the paper reply hint rather than the live-fill hint.
+  const isCarryTrend = algo.includes('CarryTrend');
+  const isPaperFirst = isSP500 || isCarryTrend;
 
   let text = emoji + ' <b>JARVIS ALERT</b>';
   if (isV10)        text += ' <i>[SHADOW]</i>';
@@ -198,12 +210,17 @@ function formatTelegram(data) {
   return text;
 }
 
-// ★ NEW: Format the FC V9 Watch heads-up (pre-market cross-confirmed notice).
+// Format the pre-market Watch heads-up (cross-confirmed notice, nothing traded).
+// ★ v4.3: was hardcoded to "🐄 FC V9 WATCH" — every fleet WATCH rendered as
+// feeder cattle regardless of what fired it (Corn Trend V1B and ZS Carry-Trend
+// both send WATCH). Emoji and title now derive from the payload.
 function formatWatch(data) {
   const wtime = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   const sig = (data.signal || '').toUpperCase();
   const dir = sig === 'WATCH_LONG' ? '🟢 LONG' : sig === 'WATCH_SHORT' ? '🔴 SHORT' : '👀 WATCH';
-  let text = '🐄 <b>FC V9 WATCH — heads-up</b>\n━━━━━━━━━━━━━━━━\n';
+  const emoji = marketEmoji(data.ticker);
+  const title = (data.algo || 'WATCH') + ' — heads-up';
+  let text = emoji + ' <b>' + title + '</b>\n━━━━━━━━━━━━━━━━\n';
   text += dir + '  ' + (data.ticker || '') + '\n';
   if (data.price) text += '💰 Close: <b>' + data.price + '</b>\n';
   if (data.message) text += '📋 ' + data.message + '\n';
@@ -341,13 +358,15 @@ const server = http.createServer((req, res) => {
       const data = parseAlert(body);
       const sigUpper = (data.signal || '').toUpperCase();
 
-      // ★ NEW: WATCH passthrough — FC V9 Watch heads-up. Send a Telegram
-      // notification ONLY. No Sheet write, no stored signal (nothing was
-      // traded, so there's nothing to reply "traded" to). Must come BEFORE
-      // the normal alert path so it never lands a junk row in the log.
+      // WATCH passthrough — pre-market heads-up. Send a Telegram notification
+      // ONLY. No Sheet write, no stored signal (nothing was traded, so there's
+      // nothing to reply "traded" to). Must come BEFORE the normal alert path
+      // so it never lands a junk row in the log. Every fleet script that emits
+      // a signal-close heads-up uses signal:"WATCH" — FC V9, Corn Trend V1B,
+      // and ZS Carry-Trend A1/A2 all route through here.
       if (sigUpper === 'WATCH' || sigUpper === 'WATCH_SHORT' || sigUpper === 'WATCH_LONG') {
         await sendTelegram(formatWatch(data));
-        console.log('WATCH forwarded (no log, no store):', data.ticker, data.signal);
+        console.log('WATCH forwarded (no log, no store):', data.ticker, data.signal, data.algo);
         return;
       }
 
