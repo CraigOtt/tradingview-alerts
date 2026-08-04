@@ -1,11 +1,31 @@
 // ═══════════════════════════════════════════════════════════
-//  Jarvis Trading Server — v1.1 (August 4, 2026)
+//  Jarvis Trading Server — v1.2 (August 4, 2026)
 //
-//  This file had no version header before today. Starting one, same
-//  style as the Pine scripts, so the next time something breaks the
-//  history is readable.
+//  v1.2 — FIX #3: THE SLIPPAGE CONFIRMATION NO LONGER LIES EITHER.
+//    handleTelegramReply() sent "✅ SLIPPAGE LOGGED" and only THEN
+//    attempted the write, never looking at the result. On July 14, 2026
+//    all four cattle fills produced that confirmation and none of the
+//    four rows landed — GFX2026 341.10, GFF2027 335.00, GFK2027 328.12,
+//    GFQ2027 325.00, $5,027.50 of adverse slippage that survived only
+//    because it happened to be printed in the Telegram message.
 //
-//  v1.1 — FIX #1: THE SERVER NO LONGER LIES TO TRADINGVIEW.
+//    Now: write first, verify with sheetWriteOk(), then send either the
+//    confirmation or a 🚨 SLIPPAGE WRITE FAILED notice. The failure
+//    notice carries a pipe-delimited paste line in Slippage-tab column
+//    order, so a failed write still leaves you something to hand-enter
+//    instead of a number you have to reconstruct a month later.
+//
+//    Refactor note: the verdict string is now derived from a plain
+//    `slipLabel` ('Favorable' / 'Minor Adverse' / 'Significant Adverse')
+//    so the same classification can go in the Telegram text and in the
+//    paste line. The displayed wording is unchanged.
+//
+//    ⚠ The paste line uses the CORRECT direction rule (it checks whether
+//    you were buying or selling). The Apps Script does not — see fix #5,
+//    still open. Until that lands, hand-entered rows will be more
+//    accurate than auto-written ones on the Direction column.
+//
+//  v1.1 — FIX #1 & #2: THE SERVER NO LONGER LIES TO TRADINGVIEW.
 //    Symptom that led here: on July 14, 2026, eight FC V9/V10 SCALE
 //    alerts fired, Telegram delivered all eight, TradingView logged
 //    "Webhook successfully delivered" on all eight, and not one row
@@ -20,42 +40,36 @@
 //    successful append — and nothing looked at it.
 //
 //    Changes in v1.1:
-//      1. /webhook now responds in a finally block AFTER the work, with
-//         502 when the sheet write fails and 500 when the handler throws.
-//         The response body names the outcome so the TradingView log
-//         becomes readable instead of a wall of identical successes.
+//      1. /webhook responds in a finally block AFTER the work, with 502
+//         when the sheet write fails and 500 when the handler throws.
 //      2. sheetWriteOk() inspects Google's reply. 'OK' and
 //         'slippage logged' pass. Everything else fails — including the
 //         silent 'NO_URL' when APPS_SCRIPT_URL is unset, and the HTML
-//         error page a stale deployment returns. (This also closes fix
-//         #2 from the review list.)
+//         error page a stale deployment returns.
 //      3. warnSheetFailure() pushes a 🚨 Telegram alarm on any failed
 //         write, naming the ticker, signal, price and Google's reply.
 //      4. formatTelegram(data) was called OUTSIDE the try block. Any
 //         throw in it killed the handler with no log and no response.
-//         Now inside.
 //      5. logToSheet(): the https request had NO timeout, so a hung
 //         Google call would never resolve. Worse, the 301/302 redirect
 //         branch had NO 'error' handler at all — an unhandled 'error'
 //         event on a ClientRequest throws and can take the process
 //         down. Both fixed; both are plausible causes of past restarts.
-//      6. sendTelegram(): added a timeout, and it now resolves null on
-//         failure instead of rejecting. Since v1.1 waits for both calls
-//         before answering, a hanging or rejecting Telegram request
-//         would otherwise block the response or mask a sheet write that
-//         actually succeeded.
+//      6. sendTelegram(): added a timeout, and it resolves null on
+//         failure instead of rejecting.
+//
+//    Verified Aug 4, 2026: `test` returned ✅ with row 27 landing at
+//    6:05:32 PM CT (~1s round trip), and with APPS_SCRIPT_URL cleared
+//    it returned 🚨 TEST FAILED / NO_URL at 6:09 PM CT.
 //
 //    KNOWN TRADEOFF: waiting for Google means a slow-but-successful
 //    write can make TradingView log a failure. That is a false alarm
 //    replacing a false all-clear, which is the safer direction to be
-//    wrong. Telegram is the reliable channel. If red statuses start
-//    appearing while rows are landing, add a bounded wait.
+//    wrong. Measured round trip is ~1s, so this is theoretical.
 //
-//    NOT CHANGED IN v1.1 — see the TODO in handleTelegramReply(). The
-//    "SLIPPAGE LOGGED" confirmation is still sent BEFORE the sheet
-//    write is awaited, so it has the same problem this version just
-//    fixed for /webhook. Left alone deliberately so this deploy tests
-//    exactly one thing.
+//  This file had no version header before v1.1. Started one in the same
+//  style as the Pine scripts so the next time something breaks, the
+//  history is readable.
 // ═══════════════════════════════════════════════════════════
 
 const http = require('http');
@@ -115,6 +129,16 @@ function marketEmoji(ticker) {
   if (t.includes('ZS')) return '🫘';
   if (t.includes('ES') || t.includes('SP') || t.includes('MES')) return '📈';
   return '📊';
+}
+
+// ── CT timestamp helpers (v1.2) ───────────────
+// Used by the slippage failure notice so a manual entry has the same
+// date/time format the Slippage tab writes automatically.
+function ctDateStr() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' }); // yyyy-mm-dd
+}
+function ctTimeStr() {
+  return new Date().toLocaleTimeString('en-GB', { timeZone: 'America/Chicago', hour12: false }); // HH:mm:ss
 }
 
 // ── Send Telegram message — returns message_id, or null ─
@@ -388,6 +412,10 @@ function formatWatch(data) {
 }
 
 // ── Handle Telegram reply for slippage ────────
+// v1.2: WRITE FIRST, VERIFY, THEN REPORT. The old order sent
+// "✅ SLIPPAGE LOGGED" before attempting the write and never read the
+// result — which is how four July 14 cattle fills produced four
+// confirmations and zero rows.
 async function handleTelegramReply(update) {
   const message = update.message;
   if (!message || !message.reply_to_message) return;
@@ -421,38 +449,25 @@ async function handleTelegramReply(update) {
                        signal.ticker.includes('ZS') ? 100 :
                        (signal.ticker.includes('ES') || signal.ticker.includes('SP')) ? 500 : 100;
 
-  const verdict = isShort
-    ? (slippageDollars >= 0 ? '✅ favorable' :
-       Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse')
-    : (slippageDollars <= 0 ? '✅ favorable' :
-       Math.abs(slippageDollars) < sigThreshold ? '⚠️ minor adverse' : '🛑 significant adverse');
+  // v1.2: plain label first, so the same classification can be reused in the
+  // paste line below. Displayed wording is unchanged from v1.1.
+  const slipLabel = isShort
+    ? (slippageDollars >= 0 ? 'Favorable'
+       : Math.abs(slippageDollars) < sigThreshold ? 'Minor Adverse' : 'Significant Adverse')
+    : (slippageDollars <= 0 ? 'Favorable'
+       : Math.abs(slippageDollars) < sigThreshold ? 'Minor Adverse' : 'Significant Adverse');
 
-  let confirmMsg =
-    '✅ <b>SLIPPAGE LOGGED</b>\n' +
-    '━━━━━━━━━━━━━━━━\n' +
+  const verdict = (slipLabel === 'Favorable' ? '✅' : slipLabel === 'Minor Adverse' ? '⚠️' : '🛑') +
+                  ' ' + slipLabel.toLowerCase();
+
+  const detailBlock =
     '📋 ' + signal.ticker + ' — ' + signal.signal + '\n' +
     '🎯 Signal: <b>' + signal.price + '</b>\n' +
     '💵 Fill:   <b>' + fillPrice + '</b>\n' +
     '📊 Slip: ' + sign + slippagePts.toFixed(4) + ' pts  (' + sign + '$' + slippageDollars.toFixed(2) + ')\n' +
     verdict + '\n';
 
-  // Sizing shadow record confirmation (ES/SP500 only)
-  if (signal.atr || signal.suggestedMes) {
-    confirmMsg += '━━━━━━━━━━━━━━━━\n';
-    if (signal.atr) confirmMsg += '📊 ATR logged: <b>' + signal.atr + '</b>\n';
-    if (signal.suggestedMes) confirmMsg += '📐 Vol-scaled size logged: <b>' + signal.suggestedMes + ' MES</b>\n';
-  }
-
-  confirmMsg += '<i>' + signal.algo + '</i>';
-
-  // ⚠️ TODO — FIX #3 FROM THE AUGUST 4 REVIEW LIST, NOT DONE YET.
-  // This says "SLIPPAGE LOGGED" BEFORE the write is attempted, which is
-  // exactly the lie v1.1 just removed from /webhook. On July 14, 2026 all
-  // four of these confirmations arrived and none of the four rows landed.
-  // The fix is to await logToSheet first, check it with sheetWriteOk(), and
-  // then send either the confirmation or a 🚨 warning. Left as-is on purpose
-  // so this deploy changes exactly one thing.
-  await sendTelegram(confirmMsg, message.message_id);
+  // ── The write. Happens BEFORE anything is claimed. ──
   const sheetResult = await logToSheet({
     action:          'logSlippage',
     ticker:          signal.ticker,
@@ -465,7 +480,53 @@ async function handleTelegramReply(update) {
     atr:             signal.atr || '',
     suggestedMes:    signal.suggestedMes || ''
   });
-  console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice, 'slip=$' + slippageDollars.toFixed(2), 'atr=' + signal.atr, 'mes=' + signal.suggestedMes, 'sheet=' + sheetResult);
+
+  if (sheetWriteOk(sheetResult)) {
+    let confirmMsg =
+      '✅ <b>SLIPPAGE LOGGED</b>\n' +
+      '━━━━━━━━━━━━━━━━\n' +
+      detailBlock;
+
+    // Sizing shadow record confirmation (ES/SP500 only)
+    if (signal.atr || signal.suggestedMes) {
+      confirmMsg += '━━━━━━━━━━━━━━━━\n';
+      if (signal.atr) confirmMsg += '📊 ATR logged: <b>' + signal.atr + '</b>\n';
+      if (signal.suggestedMes) confirmMsg += '📐 Vol-scaled size logged: <b>' + signal.suggestedMes + ' MES</b>\n';
+    }
+
+    confirmMsg += '<i>' + signal.algo + '</i>';
+    await sendTelegram(confirmMsg, message.message_id);
+    console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice,
+                'slip=$' + slippageDollars.toFixed(2), 'atr=' + signal.atr, 'mes=' + signal.suggestedMes,
+                'sheet=' + (sheetResult || '').toString().slice(0, 80));
+    return;
+  }
+
+  // ── Write failed. Say so, and hand back everything needed to enter it. ──
+  // Column order matches the Slippage tab: Date, Time CT, Ticker, Signal,
+  // Algo, Signal Price, Fill Price, Slippage (pts), Slippage ($), Direction,
+  // Entry ATR, Suggested MES.
+  const pasteLine = [
+    ctDateStr(), ctTimeStr(), signal.ticker, signal.signal, signal.algo,
+    signal.price, fillPrice, slippagePts.toFixed(4), slippageDollars.toFixed(2),
+    slipLabel, signal.atr || '', signal.suggestedMes || ''
+  ].join(' | ');
+
+  const failMsg =
+    '🚨 <b>SLIPPAGE WRITE FAILED</b>\n' +
+    '━━━━━━━━━━━━━━━━\n' +
+    detailBlock +
+    '━━━━━━━━━━━━━━━━\n' +
+    '↩️ Google said: <code>' + (sheetResult || '(empty)').toString().slice(0, 160) + '</code>\n\n' +
+    '<b>NOT SAVED.</b> Enter this on the Slippage tab by hand:\n' +
+    '<code>' + pasteLine + '</code>\n' +
+    '<i>' + signal.algo + '</i>';
+
+  await sendTelegram(failMsg, message.message_id);
+  console.error('SLIPPAGE WRITE FAILED —', signal.ticker, signal.signal,
+                'signal=' + signal.price, 'fill=' + fillPrice,
+                'slip=$' + slippageDollars.toFixed(2),
+                '→', (sheetResult || '').toString().slice(0, 160));
 }
 
 // ── Handle manual price commands from Telegram ──
@@ -487,7 +548,7 @@ async function handlePriceCommand(update) {
   if (priceMatch) {
     const result = await logToSheet({ action: 'updatePrice', ticker: priceMatch[1], price: priceMatch[2] });
     const ok = /^OK/i.test((result || '').toString());
-    await sendTelegram((ok ? '✅ ' : '⚠️ ') + result, message.message_id);
+    await sendTelegram((ok ? '✅ ' : '🚨 ') + result, message.message_id);
     console.log('price command run —', priceMatch[1], priceMatch[2], '→', (result || '').toString().slice(0, 120));
     return true;
   }
@@ -504,7 +565,7 @@ async function handlePriceCommand(update) {
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
-    res.end('🌽🫘🐄📈 Jarvis Trading Server v1.1 — Online (verified sheet writes)');
+    res.end('🌽🫘🐄📈 Jarvis Trading Server v1.2 — Online (verified sheet writes)');
     return;
   }
 
@@ -670,6 +731,6 @@ process.on('unhandledRejection', (err) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log('Jarvis Trading Server v1.1 running on port ' + PORT);
+  console.log('Jarvis Trading Server v1.2 running on port ' + PORT);
   console.log('Telegram configured:', !!TELEGRAM_BOT_TOKEN, '| Chat ID:', TELEGRAM_CHAT_ID, '| Apps Script URL:', !!APPS_SCRIPT_URL);
 });
