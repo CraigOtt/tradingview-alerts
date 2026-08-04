@@ -1,3 +1,63 @@
+// ═══════════════════════════════════════════════════════════
+//  Jarvis Trading Server — v1.1 (August 4, 2026)
+//
+//  This file had no version header before today. Starting one, same
+//  style as the Pine scripts, so the next time something breaks the
+//  history is readable.
+//
+//  v1.1 — FIX #1: THE SERVER NO LONGER LIES TO TRADINGVIEW.
+//    Symptom that led here: on July 14, 2026, eight FC V9/V10 SCALE
+//    alerts fired, Telegram delivered all eight, TradingView logged
+//    "Webhook successfully delivered" on all eight, and not one row
+//    reached the Google Sheet. The monthly review could not tell
+//    whether the alerts had fired at all.
+//
+//    Cause: /webhook called res.end('OK') as its FIRST action, before
+//    parsing the body, before Telegram, and before the sheet write.
+//    TradingView's status column therefore only ever meant "the Node
+//    process accepted the TCP request." It could never mean "the row
+//    landed." logToSheet() already returns Google's reply — 'OK' on a
+//    successful append — and nothing looked at it.
+//
+//    Changes in v1.1:
+//      1. /webhook now responds in a finally block AFTER the work, with
+//         502 when the sheet write fails and 500 when the handler throws.
+//         The response body names the outcome so the TradingView log
+//         becomes readable instead of a wall of identical successes.
+//      2. sheetWriteOk() inspects Google's reply. 'OK' and
+//         'slippage logged' pass. Everything else fails — including the
+//         silent 'NO_URL' when APPS_SCRIPT_URL is unset, and the HTML
+//         error page a stale deployment returns. (This also closes fix
+//         #2 from the review list.)
+//      3. warnSheetFailure() pushes a 🚨 Telegram alarm on any failed
+//         write, naming the ticker, signal, price and Google's reply.
+//      4. formatTelegram(data) was called OUTSIDE the try block. Any
+//         throw in it killed the handler with no log and no response.
+//         Now inside.
+//      5. logToSheet(): the https request had NO timeout, so a hung
+//         Google call would never resolve. Worse, the 301/302 redirect
+//         branch had NO 'error' handler at all — an unhandled 'error'
+//         event on a ClientRequest throws and can take the process
+//         down. Both fixed; both are plausible causes of past restarts.
+//      6. sendTelegram(): added a timeout, and it now resolves null on
+//         failure instead of rejecting. Since v1.1 waits for both calls
+//         before answering, a hanging or rejecting Telegram request
+//         would otherwise block the response or mask a sheet write that
+//         actually succeeded.
+//
+//    KNOWN TRADEOFF: waiting for Google means a slow-but-successful
+//    write can make TradingView log a failure. That is a false alarm
+//    replacing a false all-clear, which is the safer direction to be
+//    wrong. Telegram is the reliable channel. If red statuses start
+//    appearing while rows are landing, add a bounded wait.
+//
+//    NOT CHANGED IN v1.1 — see the TODO in handleTelegramReply(). The
+//    "SLIPPAGE LOGGED" confirmation is still sent BEFORE the sheet
+//    write is awaited, so it has the same problem this version just
+//    fixed for /webhook. Left alone deliberately so this deploy tests
+//    exactly one thing.
+// ═══════════════════════════════════════════════════════════
+
 const http = require('http');
 const https = require('https');
 
@@ -5,6 +65,12 @@ const https = require('https');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const APPS_SCRIPT_URL    = process.env.APPS_SCRIPT_URL;
+
+// ── Timeouts (v1.1) ───────────────────────────
+// Nothing outbound was time-bounded before. A hung call used to mean the
+// webhook never answered at all.
+const SHEET_TIMEOUT_MS    = 10000;
+const TELEGRAM_TIMEOUT_MS = 8000;
 
 // ── In-memory signal store ────────────────────
 const recentSignals = new Map();
@@ -40,8 +106,8 @@ function getMultiplier(ticker) {
   return 1;
 }
 
-// ★ v4.3: shared emoji resolver — one place, used by both the fill-alert
-// formatter and the WATCH formatter (formatWatch used to hardcode the cow).
+// Shared emoji resolver — one place, used by both the fill-alert formatter
+// and the WATCH formatter.
 function marketEmoji(ticker) {
   const t = ticker || '';
   if (t.includes('GF')) return '🐄';
@@ -51,23 +117,32 @@ function marketEmoji(ticker) {
   return '📊';
 }
 
-// ── Send Telegram message — returns message_id ─
+// ── Send Telegram message — returns message_id, or null ─
+// v1.1: time-bounded, and resolves null on failure rather than rejecting.
+// A Telegram outage must not block the webhook response or make a
+// successful sheet write look like a crash.
 function sendTelegram(text, replyToMessageId) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
       console.log('Telegram not configured — skipping');
       resolve(null);
       return;
     }
+
+    let settled = false;
+    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
+
     const payload = { chat_id: TELEGRAM_CHAT_ID, text: text, parse_mode: 'HTML' };
     if (replyToMessageId) payload.reply_to_message_id = replyToMessageId;
     const payloadStr = JSON.stringify(payload);
+
     const options = {
       hostname: 'api.telegram.org',
       path:     '/bot' + TELEGRAM_BOT_TOKEN + '/sendMessage',
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payloadStr) }
     };
+
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -75,46 +150,139 @@ function sendTelegram(text, replyToMessageId) {
         try {
           const parsed = JSON.parse(data);
           const messageId = parsed.result && parsed.result.message_id;
+          if (!messageId) console.error('Telegram returned no message_id:', data.slice(0, 200));
           console.log('Telegram sent, message_id:', messageId);
-          resolve(messageId);
-        } catch(e) {
-          console.log('Telegram response (parse error):', data);
-          resolve(null);
+          done(messageId || null);
+        } catch (e) {
+          console.error('Telegram response (parse error):', data.slice(0, 200));
+          done(null);
         }
       });
     });
-    req.on('error', (err) => { console.error('Telegram error:', err.message); reject(err); });
+
+    req.setTimeout(TELEGRAM_TIMEOUT_MS, () => {
+      req.destroy(new Error('Telegram did not respond in ' + TELEGRAM_TIMEOUT_MS + 'ms'));
+    });
+    req.on('error', (err) => {
+      console.error('Telegram error:', err.message);
+      done(null);
+    });
     req.write(payloadStr);
     req.end();
   });
 }
 
 // ── Log to Google Sheet via Apps Script ───────
-// Returns the Apps Script response text so callers can verify success.
+// Returns Google's raw reply text so callers can verify success.
+// v1.1: both the initial request and the redirect follow are now
+// time-bounded and both have error handlers. The redirect branch
+// previously had neither.
 function logToSheet(params) {
   return new Promise((resolve) => {
-    if (!APPS_SCRIPT_URL) { console.log('Sheet log SKIPPED: APPS_SCRIPT_URL not set'); resolve('NO_URL'); return; }
+    if (!APPS_SCRIPT_URL) {
+      console.error('Sheet log SKIPPED: APPS_SCRIPT_URL not set');
+      resolve('NO_URL');
+      return;
+    }
+
+    let settled = false;
+    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
+
     const url = new URL(APPS_SCRIPT_URL);
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+
     const options = {
       hostname: url.hostname,
       path:     url.pathname + url.search,
       method:   'GET',
       headers:  { 'User-Agent': 'Jarvis-Trading-Bot/1.0' }
     };
+
     const req = https.request(options, (res) => {
+      // Apps Script web apps answer with a 302 to script.googleusercontent.com
       if (res.statusCode === 301 || res.statusCode === 302) {
-        const redirectUrl = new URL(res.headers.location);
-        https.request({ hostname: redirectUrl.hostname, path: redirectUrl.pathname + redirectUrl.search, method: 'GET' }, (r2) => {
-          let d = ''; r2.on('data', c => d += c); r2.on('end', () => { console.log('Sheet log:', d); resolve(d); });
-        }).end();
-      } else {
-        let d = ''; res.on('data', c => d += c); res.on('end', () => { console.log('Sheet log:', d); resolve(d); });
+        res.resume(); // drain the redirect body
+
+        let redirectUrl;
+        try {
+          redirectUrl = new URL(res.headers.location);
+        } catch (e) {
+          console.error('Sheet redirect had a bad Location header:', res.headers.location);
+          done('ERROR: bad redirect location');
+          return;
+        }
+
+        const req2 = https.request({
+          hostname: redirectUrl.hostname,
+          path:     redirectUrl.pathname + redirectUrl.search,
+          method:   'GET',
+          headers:  { 'User-Agent': 'Jarvis-Trading-Bot/1.0' }
+        }, (r2) => {
+          let d = '';
+          r2.on('data', c => d += c);
+          r2.on('end', () => {
+            console.log('Sheet log [' + r2.statusCode + ']:', d.slice(0, 200));
+            done(d);
+          });
+        });
+
+        req2.setTimeout(SHEET_TIMEOUT_MS, () => {
+          req2.destroy(new Error('Google redirect did not respond in ' + SHEET_TIMEOUT_MS + 'ms'));
+        });
+        req2.on('error', (err) => {
+          console.error('Sheet redirect error:', err.message);
+          done('ERROR: ' + err.message);
+        });
+        req2.end();
+        return;
       }
+
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        console.log('Sheet log [' + res.statusCode + ']:', d.slice(0, 200));
+        done(d);
+      });
     });
-    req.on('error', (err) => { console.error('Sheet error:', err.message); resolve('ERROR: ' + err.message); });
+
+    req.setTimeout(SHEET_TIMEOUT_MS, () => {
+      req.destroy(new Error('Google did not respond in ' + SHEET_TIMEOUT_MS + 'ms'));
+    });
+    req.on('error', (err) => {
+      console.error('Sheet error:', err.message);
+      done('ERROR: ' + err.message);
+    });
     req.end();
   });
+}
+
+// ── Did the sheet actually take the row? (v1.1) ────────────
+// Apps Script doGet replies with the literal 'OK'. The logSlippage action
+// replies 'slippage logged'. A thrown error replies 'Error: ...'. A stale or
+// misconfigured deployment returns a Google HTML error page. And logToSheet
+// returns 'NO_URL' when the env var is missing. Anything that is not a
+// known-good string is a failure.
+function sheetWriteOk(reply) {
+  const r = (reply || '').toString().trim();
+  return /^OK\b/i.test(r) || /^slippage logged$/i.test(r);
+}
+
+// ── Alarm on a failed write (v1.1) ────────────────────────
+// This is the message that did not exist on July 14, 2026.
+async function warnSheetFailure(context, reply) {
+  const detail = (reply || '(empty)').toString().slice(0, 200);
+  console.error('SHEET WRITE FAILED —', context, '→', detail);
+  try {
+    await sendTelegram(
+      '🚨 <b>SHEET WRITE FAILED</b>\n' +
+      '━━━━━━━━━━━━━━━━\n' +
+      '📋 ' + context + '\n' +
+      '↩️ Google said: <code>' + detail + '</code>\n\n' +
+      '<i>The alert fired. The row did NOT land. Log it by hand.</i>'
+    );
+  } catch (e) {
+    console.error('Could not send the failure warning:', e.message);
+  }
 }
 
 // ── Parse incoming alert message ──────────────
@@ -130,9 +298,6 @@ function parseField(msg, field) {
 
 // ── Format Telegram alert message ────────────
 function formatTelegram(data) {
-  // ★ CHANGED: was toLocaleTimeString (time only). Now toLocaleString with
-  // date fields so alerts show the full date + time, both from ONE
-  // America/Chicago timestamp (the date can't drift off the time near midnight).
   const time = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   const msg      = (data.message || '').toString();
   const ticker   = data.ticker  || '';
@@ -155,7 +320,7 @@ function formatTelegram(data) {
   const posMatch = msg.match(/POS:\s*(-?\d+)/);
   const pos = posMatch ? parseInt(posMatch[1]) : null;
 
-  const emoji = marketEmoji(ticker);   // ★ v4.3 — shared resolver
+  const emoji = marketEmoji(ticker);
 
   let sigEmoji = '';
   if (signal === 'LONG' || signal === 'BUY') sigEmoji = '🟢';
@@ -165,8 +330,6 @@ function formatTelegram(data) {
 
   const isV10        = algo.includes('V10');
   const isSP500      = algo.includes('SP500');
-  // ★ v4.3: ZS Carry-Trend is paper too (sub-bar, owner override), so it gets
-  // the [PAPER] tag and the paper reply hint rather than the live-fill hint.
   const isCarryTrend = algo.includes('CarryTrend');
   const isPaperFirst = isSP500 || isCarryTrend;
 
@@ -202,8 +365,6 @@ function formatTelegram(data) {
   } else if (isPaperFirst) {
     text += '\n<i>📋 Paper — just reply "traded [price]". ATR & size auto-logged.</i>';
   } else {
-    // ★ CHANGED: was a hardcoded 'Reply "traded 356.50"' (a corn price that
-    // showed up misleadingly on cattle/bean alerts). Now generic.
     text += '\n<i>Reply "traded [your fill price]" to log your fill</i>';
   }
 
@@ -211,9 +372,6 @@ function formatTelegram(data) {
 }
 
 // Format the pre-market Watch heads-up (cross-confirmed notice, nothing traded).
-// ★ v4.3: was hardcoded to "🐄 FC V9 WATCH" — every fleet WATCH rendered as
-// feeder cattle regardless of what fired it (Corn Trend V1B and ZS Carry-Trend
-// both send WATCH). Emoji and title now derive from the payload.
 function formatWatch(data) {
   const wtime = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   const sig = (data.signal || '').toUpperCase();
@@ -287,6 +445,13 @@ async function handleTelegramReply(update) {
 
   confirmMsg += '<i>' + signal.algo + '</i>';
 
+  // ⚠️ TODO — FIX #3 FROM THE AUGUST 4 REVIEW LIST, NOT DONE YET.
+  // This says "SLIPPAGE LOGGED" BEFORE the write is attempted, which is
+  // exactly the lie v1.1 just removed from /webhook. On July 14, 2026 all
+  // four of these confirmations arrived and none of the four rows landed.
+  // The fix is to await logToSheet first, check it with sheetWriteOk(), and
+  // then send either the confirmation or a 🚨 warning. Left as-is on purpose
+  // so this deploy changes exactly one thing.
   await sendTelegram(confirmMsg, message.message_id);
   const sheetResult = await logToSheet({
     action:          'logSlippage',
@@ -303,18 +468,14 @@ async function handleTelegramReply(update) {
   console.log('Slippage logged:', signal.ticker, 'signal=' + signal.price, 'fill=' + fillPrice, 'slip=$' + slippageDollars.toFixed(2), 'atr=' + signal.atr, 'mes=' + signal.suggestedMes, 'sheet=' + sheetResult);
 }
 
-// ★ NEW (July 17, 2026): Handle manual price commands from Telegram.
+// ── Handle manual price commands from Telegram ──
 //   "prices"              → returns the current Prices-tab list
-//   "price TICKER VALUE"  → writes/updates one price (e.g. price GFX2026 356.50)
-// Uses the SAME logToSheet() path as everything else, so it hits the Apps
-// Script updatePrice/getPrices actions on APPS_SCRIPT_URL. Returns true if it
-// handled the message (so the caller can stop), false otherwise.
+//   "price TICKER VALUE"  → writes/updates one price
 async function handlePriceCommand(update) {
   const message = update.message;
   if (!message) return false;
   const rawText = (message.text || '').trim();
 
-  // "prices" — list everything currently stored
   if (/^prices$/i.test(rawText)) {
     const list = await logToSheet({ action: 'getPrices' });
     await sendTelegram('💲 <b>Current Prices</b>\n━━━━━━━━━━━━━━━━\n' + (list || '(none)'), message.message_id);
@@ -322,7 +483,6 @@ async function handlePriceCommand(update) {
     return true;
   }
 
-  // "price TICKER VALUE" — set/update one contract
   const priceMatch = rawText.match(/^price\s+(\S+)\s+([\d.]+)/i);
   if (priceMatch) {
     const result = await logToSheet({ action: 'updatePrice', ticker: priceMatch[1], price: priceMatch[2] });
@@ -332,7 +492,6 @@ async function handlePriceCommand(update) {
     return true;
   }
 
-  // Started with "price" but the format was wrong — show usage instead of silence
   if (/^price(\s|$)/i.test(rawText)) {
     await sendTelegram('Usage: <code>price TICKER VALUE</code>\nExample: <code>price GFX2026 356.50</code>\nOr text <code>prices</code> to see the full list.', message.message_id);
     return true;
@@ -345,55 +504,110 @@ async function handlePriceCommand(update) {
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
-    res.end('🌽🫘🐄📈 Jarvis Trading Server — Online (Slippage + Sizing Shadow Active)');
+    res.end('🌽🫘🐄📈 Jarvis Trading Server v1.1 — Online (verified sheet writes)');
     return;
   }
+
+  // ═══════════════════════════════════════════════════════
+  //  /webhook — v1.1: answers TradingView AFTER the work,
+  //  with the real outcome.
+  // ═══════════════════════════════════════════════════════
   if (req.method === 'POST' && req.url === '/webhook') {
     let body = '';
     req.on('data', chunk => body += chunk.toString());
     req.on('end', async () => {
       console.log('Alert received:', body);
-      res.writeHead(200);
-      res.end('OK');
-      const data = parseAlert(body);
-      const sigUpper = (data.signal || '').toUpperCase();
 
-      // WATCH passthrough — pre-market heads-up. Send a Telegram notification
-      // ONLY. No Sheet write, no stored signal (nothing was traded, so there's
-      // nothing to reply "traded" to). Must come BEFORE the normal alert path
-      // so it never lands a junk row in the log. Every fleet script that emits
-      // a signal-close heads-up uses signal:"WATCH" — FC V9, Corn Trend V1B,
-      // and ZS Carry-Trend A1/A2 all route through here.
-      if (sigUpper === 'WATCH' || sigUpper === 'WATCH_SHORT' || sigUpper === 'WATCH_LONG') {
-        await sendTelegram(formatWatch(data));
-        console.log('WATCH forwarded (no log, no store):', data.ticker, data.signal, data.algo);
-        return;
-      }
+      let status   = 200;
+      let reply    = 'OK';
+      let answered = false;
 
-      // SKIP = composite filter suppressed an entry (SP500 V2 dead-zone).
-      // Log to the sheet for the dashboard skip counter, but no Telegram
-      // ping and no stored signal — nothing was traded, so there's nothing
-      // to reply "traded" to. Prevents noise pings and bogus slippage logs.
-      if (sigUpper === 'SKIP') {
-        await logToSheet({ ticker: data.ticker || '', signal: data.signal || '', price: data.price || '', algo: data.algo || '', message: data.message || body });
-        console.log('SKIP logged (no Telegram, no store):', data.ticker, data.price);
-        return;
-      }
-
-      const telegramMsg = formatTelegram(data);
       try {
-        const [messageId] = await Promise.all([
-          sendTelegram(telegramMsg),
-          logToSheet({ ticker: data.ticker || '', signal: data.signal || '', price: data.price || '', algo: data.algo || '', message: data.message || body })
-        ]);
-        if (messageId && data.ticker && data.price) storeSignal(messageId, data);
-        console.log('Alert processed successfully');
-      } catch(err) {
+        const data     = parseAlert(body);
+        const sigUpper = (data.signal || '').toUpperCase();
+
+        // WATCH passthrough — pre-market heads-up. Telegram only, no sheet
+        // write by design (nothing was traded, so there is nothing to log
+        // and nothing to reply "traded" to).
+        if (sigUpper === 'WATCH' || sigUpper === 'WATCH_SHORT' || sigUpper === 'WATCH_LONG') {
+          await sendTelegram(formatWatch(data));
+          reply = 'WATCH forwarded — no sheet write by design';
+          console.log('WATCH forwarded:', data.ticker, data.signal, data.algo);
+
+        // SKIP — composite filter suppressed an entry (SP500 V2 dead zone).
+        // Logged for the dashboard skip counter, no Telegram ping.
+        } else if (sigUpper === 'SKIP') {
+          const skipReply = await logToSheet({
+            ticker:  data.ticker  || '',
+            signal:  data.signal  || '',
+            price:   data.price   || '',
+            algo:    data.algo    || '',
+            message: data.message || body
+          });
+          if (sheetWriteOk(skipReply)) {
+            reply = 'SKIP logged';
+          } else {
+            status = 502;
+            reply  = 'SHEET WRITE FAILED: ' + skipReply;
+            await warnSheetFailure('SKIP ' + (data.ticker || '') + ' ' + (data.algo || ''), skipReply);
+          }
+          console.log('SKIP:', data.ticker, data.price, '→', skipReply);
+
+        // Normal fill alert — Telegram + sheet, then verify the sheet.
+        } else {
+          const telegramMsg = formatTelegram(data);   // v1.1: inside the try
+
+          const [messageId, sheetReply] = await Promise.all([
+            sendTelegram(telegramMsg),
+            logToSheet({
+              ticker:  data.ticker  || '',
+              signal:  data.signal  || '',
+              price:   data.price   || '',
+              algo:    data.algo    || '',
+              message: data.message || body
+            })
+          ]);
+
+          if (messageId && data.ticker && data.price) storeSignal(messageId, data);
+
+          if (sheetWriteOk(sheetReply)) {
+            reply = 'OK — logged ' + (data.ticker || '') + ' ' + (data.signal || '');
+            console.log('Alert processed. Sheet reply:', (sheetReply || '').toString().slice(0, 120));
+          } else {
+            status = 502;
+            reply  = 'SHEET WRITE FAILED: ' + sheetReply;
+            await warnSheetFailure(
+              (data.algo || '') + ' ' + (data.signal || '') + ' ' +
+              (data.ticker || '') + ' @ ' + (data.price || ''),
+              sheetReply
+            );
+          }
+        }
+
+      } catch (err) {
+        status = 500;
+        reply  = 'ERROR: ' + err.message;
         console.error('Alert processing error:', err.message);
+        try {
+          await sendTelegram(
+            '🚨 <b>ALERT PROCESSING CRASHED</b>\n' +
+            '━━━━━━━━━━━━━━━━\n' +
+            '<code>' + err.message + '</code>\n' +
+            '<i>Raw payload: ' + body.slice(0, 200) + '</i>'
+          );
+        } catch (e) { /* nothing left to try */ }
+
+      } finally {
+        if (!answered) {
+          answered = true;
+          res.writeHead(status, { 'Content-Type': 'text/plain' });
+          res.end(reply);
+        }
       }
     });
     return;
   }
+
   if (req.method === 'POST' && req.url === '/telegram') {
     let body = '';
     req.on('data', chunk => body += chunk.toString());
@@ -405,11 +619,6 @@ const server = http.createServer((req, res) => {
         console.log('Telegram update:', JSON.stringify(update).slice(0, 300));
 
         // ── TEST command — exercises the full Sheet-write chain on demand ──
-        // Text "test" to the bot to verify logging end-to-end. It performs a
-        // real write to the Sheet (a TEST row), then reports the actual result
-        // back to you — including whether APPS_SCRIPT_URL is even loaded.
-        // This is the same logToSheet() path the live alerts use, so if this
-        // succeeds, real signals will log too.
         const incomingText = (update.message && update.message.text || '').trim().toLowerCase();
         if (incomingText === 'test') {
           const stamp = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' });
@@ -420,24 +629,24 @@ const server = http.createServer((req, res) => {
             algo:    'SYSTEM TEST',
             message: 'connectivity test ' + stamp
           });
-          const ok = /OK/i.test(sheetResult);
+          // v1.1: same verifier the webhook uses, instead of a loose /OK/ match
+          // that an HTML error page containing the word "ok" could satisfy.
+          const ok = sheetWriteOk(sheetResult);
           const report =
-            (ok ? '✅ <b>TEST PASSED</b>' : '❌ <b>TEST — check result</b>') + '\n' +
+            (ok ? '✅ <b>TEST PASSED</b>' : '🚨 <b>TEST FAILED</b>') + '\n' +
             '━━━━━━━━━━━━━━━━\n' +
             'APPS_SCRIPT_URL: ' + (APPS_SCRIPT_URL ? '✅ SET' : '❌ MISSING') + '\n' +
             'Telegram: ✅ working (you got this)\n' +
-            'Sheet write reply: <code>' + (sheetResult || '(empty)').toString().slice(0, 120) + '</code>\n' +
+            'Sheet write reply: <code>' + (sheetResult || '(empty)').toString().slice(0, 160) + '</code>\n' +
             '⏰ ' + stamp + ' CT\n\n' +
-            '<i>Now open Sheet1 — a TEST row should appear. If it did, logging is fully live.</i>';
+            (ok
+              ? '<i>Now open the log tab — a TEST row should be there. If it is not, the row landed somewhere else (see fix #4, getActiveSheet).</i>'
+              : '<i>The write did NOT land. Nothing is being logged right now.</i>');
           await sendTelegram(report, update.message.message_id);
-          console.log('TEST command run — sheet result:', sheetResult);
+          console.log('TEST command run — sheet result:', (sheetResult || '').toString().slice(0, 160), '| ok:', ok);
           return;
         }
 
-        // ★ NEW: price / prices commands. Check before the "traded" reply
-        // handler — a price command is a fresh message, not a reply, so it
-        // wouldn't be caught there anyway, but handling it explicitly and
-        // returning keeps the paths clean.
         const handledPrice = await handlePriceCommand(update);
         if (handledPrice) return;
 
@@ -448,12 +657,19 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+
   res.writeHead(404);
   res.end('Not found');
 });
 
+// v1.1: last-resort net. An unhandled rejection used to be able to kill the
+// process silently, which is one candidate for the restarts seen in July.
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err && err.message ? err.message : err);
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log('Jarvis Trading Server running on port ' + PORT);
-  console.log('Telegram configured:', !!TELEGRAM_BOT_TOKEN, '| Chat ID:', TELEGRAM_CHAT_ID);
+  console.log('Jarvis Trading Server v1.1 running on port ' + PORT);
+  console.log('Telegram configured:', !!TELEGRAM_BOT_TOKEN, '| Chat ID:', TELEGRAM_CHAT_ID, '| Apps Script URL:', !!APPS_SCRIPT_URL);
 });
